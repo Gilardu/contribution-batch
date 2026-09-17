@@ -1,0 +1,184 @@
+name: Backfill Blank Contribution Days
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "First date to check (YYYY-MM-DD)"
+        required: true
+        default: "2025-09-18"
+      end_date:
+        description: "Last date to check (YYYY-MM-DD)"
+        required: true
+        default: "2026-09-16"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: backfill-contributions
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out default branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Find blank contribution days
+        shell: bash
+        env:
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+          USERNAME: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+          import urllib.request
+          from datetime import date
+
+          start = date.fromisoformat(os.environ["START_DATE"])
+          end = date.fromisoformat(os.environ["END_DATE"])
+          username = os.environ["USERNAME"]
+
+          if end < start:
+              raise SystemExit("end_date must be on or after start_date")
+
+          url = (
+              f"https://github.com/users/{username}/contributions"
+              f"?from={start.isoformat()}&to={end.isoformat()}"
+          )
+
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "User-Agent": "Mozilla/5.0",
+                  "Accept": "text/html",
+              },
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              page = response.read().decode("utf-8", errors="replace")
+
+          blanks = []
+          seen = set()
+
+          # GitHub currently renders contribution days as HTML elements carrying
+          # data-date and data-level attributes. Level 0 means no contribution.
+          for tag in re.findall(r"<[^>]+>", page):
+              date_match = re.search(r'data-date="(\d{4}-\d{2}-\d{2})"', tag)
+              if not date_match:
+                  continue
+
+              day = date.fromisoformat(date_match.group(1))
+              if day < start or day > end or day in seen:
+                  continue
+
+              level_match = re.search(r'data-level="(\d+)"', tag)
+              count_match = re.search(r'data-count="(\d+)"', tag)
+
+              is_blank = False
+              if count_match:
+                  is_blank = int(count_match.group(1)) == 0
+              elif level_match:
+                  is_blank = int(level_match.group(1)) == 0
+
+              if is_blank:
+                  blanks.append(day.isoformat())
+                  seen.add(day)
+
+          with open("/tmp/blank-days.txt", "w", encoding="utf-8") as f:
+              for day in sorted(blanks):
+                  f.write(day + "\n")
+
+          print(f"Found {len(blanks)} blank contribution days.")
+          if blanks:
+              print("First blank:", blanks[0])
+              print("Last blank:", blanks[-1])
+          PY
+
+          echo "Blank-day count:"
+          wc -l /tmp/blank-days.txt
+
+      - name: Create randomized historical commits
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -s /tmp/blank-days.txt ]; then
+            echo "No blank days found. Nothing to do."
+            exit 0
+          fi
+
+          git config user.name "$ACTOR"
+          git config user.email "${ACTOR_ID}+${ACTOR}@users.noreply.github.com"
+
+          git pull --ff-only origin "$DEFAULT_BRANCH"
+
+          MARKER_FILE=".contribution-backfill.log"
+          total_commits=0
+          total_days=0
+
+          random_count() {
+            # Weighted random pattern:
+            # ~45% very light: 1-2 commits
+            # ~30% light:      3-5 commits
+            # ~18% medium:     6-10 commits
+            # ~7% stronger:   11-20 commits
+            r=$((RANDOM % 100))
+
+            if [ "$r" -lt 45 ]; then
+              echo $((1 + RANDOM % 2))
+            elif [ "$r" -lt 75 ]; then
+              echo $((3 + RANDOM % 3))
+            elif [ "$r" -lt 93 ]; then
+              echo $((6 + RANDOM % 5))
+            else
+              echo $((11 + RANDOM % 10))
+            fi
+          }
+
+          while IFS= read -r day; do
+            [ -z "$day" ] && continue
+
+            count="$(random_count)"
+            total_days=$((total_days + 1))
+
+            echo "$day -> $count commit(s)"
+
+            for i in $(seq 1 "$count"); do
+              printf "%s | activity %02d/%02d\n" "$day" "$i" "$count" >> "$MARKER_FILE"
+              git add "$MARKER_FILE"
+
+              # Noon UTC keeps the commit safely inside the intended calendar day.
+              COMMIT_DATE="${day}T12:00:00+00:00"
+
+              GIT_AUTHOR_DATE="$COMMIT_DATE" \
+              GIT_COMMITTER_DATE="$COMMIT_DATE" \
+                git commit --quiet -m "Activity ${day} ${i}/${count}"
+
+              total_commits=$((total_commits + 1))
+            done
+          done < /tmp/blank-days.txt
+
+          echo "Created $total_commits commits across $total_days previously blank days."
+          git push origin "HEAD:${DEFAULT_BRANCH}"
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "Backfill finished."
+          echo "Existing non-blank days were left unchanged."
+          echo "Refresh your GitHub profile after GitHub recalculates the contribution graph."
